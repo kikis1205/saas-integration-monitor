@@ -1,0 +1,19 @@
+# Local development Postgres only — not used to run the Node app.
+# Requires Docker Desktop (or another Docker Engine) on Windows.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sim-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: sim
+      POSTGRES_PASSWORD: sim
+      POSTGRES_DB: sim
+    volumes:
+      - sim_pgdata:/var/lib/postgresql/data
+
+volumes:
+  sim_pgdata:
