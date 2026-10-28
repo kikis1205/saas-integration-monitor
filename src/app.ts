@@ -2,6 +2,7 @@ import express from "express";
 import { ZodError } from "zod";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
 import { webhookEventSchema } from "./schemas/webhookEvent";
+import { createEvent, toEventResponse } from "./services/events";
 
 export function createApp() {
   const app = express();
@@ -18,23 +19,22 @@ export function createApp() {
   });
 
   /**
-   * Accepts a webhook event, validates with Zod, and acknowledges it.
-   * Milestone 1 does not persist events — that comes later.
+   * Accept a webhook event, validate with Zod, persist, then acknowledge.
+   * Success only after a successful DB write. Does not forward externally.
    */
-  app.post("/api/v1/webhooks/events", (req, res, next) => {
+  app.post("/api/v1/webhooks/events", async (req, res, next) => {
     try {
       const event = webhookEventSchema.parse(req.body);
+      const created = await createEvent(event);
 
       // Do not log full payloads (may contain sensitive customer data).
-      console.info("Webhook accepted", {
-        event_id: event.event_id,
-        event_type: event.event_type,
+      console.info("Webhook stored", {
+        id: created.id,
+        event_id: created.eventId,
+        event_type: created.eventType,
       });
 
-      res.status(202).json({
-        status: "accepted",
-        event_id: event.event_id,
-      });
+      res.status(201).json(toEventResponse(created));
     } catch (err) {
       if (err instanceof ZodError) {
         res.status(400).json({

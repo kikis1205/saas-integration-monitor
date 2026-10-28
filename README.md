@@ -1,11 +1,13 @@
 # saas-integration-monitor
 
-Minimal webhook API for a SaaS integration monitoring portfolio project (milestone 1).
+Minimal webhook API for a SaaS integration monitoring portfolio project.
 
 ## What it does
 
 - `GET /health` — service health check
-- `POST /api/v1/webhooks/events` — accept and validate a webhook event (no persistence yet)
+- `POST /api/v1/webhooks/events` — validate a webhook event, **persist** it, then return the created resource
+
+Events are stored locally in Postgres. This API does **not** forward or deliver events to external systems.
 
 ## Prerequisites
 
@@ -19,9 +21,7 @@ Minimal webhook API for a SaaS integration monitoring portfolio project (milesto
 npm install
 ```
 
-## Local PostgreSQL (Milestone 2 Step 1 — schema tooling)
-
-Persistence is not wired into API routes yet. This step only adds Prisma, the `Event` schema, and a local Postgres bring-up path.
+## Local PostgreSQL
 
 ### 1. Install / start Docker Desktop (if needed)
 
@@ -57,6 +57,8 @@ Copy-Item .env.example .env
 ```
 
 `.env` is gitignored. Never commit real secrets.
+
+The process **fails fast** at startup if `DATABASE_URL` is missing or Postgres is unreachable (it will not listen).
 
 ### 4. Generate client and run migrations
 
@@ -100,7 +102,7 @@ npm start
 Invoke-RestMethod -Uri http://localhost:3000/health -Method Get
 ```
 
-### Valid webhook
+### Valid webhook (persisted → 201)
 
 ```powershell
 $body = @{
@@ -112,6 +114,12 @@ $body = @{
 
 Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body $body
 ```
+
+Expect **201** with the created resource (`id`, `event_id`, `event_type`, `occurred_at`, `payload`, `received_at`).
+
+### Duplicate `event_id` → 409
+
+Posting the same `event_id` again returns **409** with `code: CONFLICT`.
 
 ### Invalid webhook (missing fields)
 
@@ -133,10 +141,13 @@ Expect **400** with `code: INVALID_JSON`.
 
 ```
 prisma/
-  schema.prisma            # Event model (M2 Step 1; not used by routes yet)
+  schema.prisma            # Event model
+  migrations/              # SQL migrations
 src/
-  index.ts                 # process entry — binds PORT
+  index.ts                 # process entry — fail-fast DB check, binds PORT
   app.ts                   # Express app, routes
+  db/prisma.ts             # PrismaClient singleton
+  services/events.ts       # createEvent persistence
   schemas/webhookEvent.ts  # Zod validation schema
   middleware/errorHandler.ts
 docker-compose.yml         # local Postgres 16 only
