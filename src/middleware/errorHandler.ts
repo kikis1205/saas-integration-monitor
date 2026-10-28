@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import type { ErrorRequestHandler, RequestHandler } from "express";
 
 type ErrorBody = {
@@ -36,7 +37,7 @@ function isBodyTooLargeError(err: unknown): boolean {
   );
 }
 
-/** Catch-all for unexpected failures. Never expose stack traces to clients. */
+/** Catch-all for unexpected failures. Never expose stack traces or SQL to clients. */
 export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   if (isMalformedJsonError(err)) {
     sendError(res, 400, {
@@ -50,6 +51,37 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     sendError(res, 413, {
       code: "PAYLOAD_TOO_LARGE",
       message: "Request body exceeds the 100 KB size limit",
+    });
+    return;
+  }
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === "P2002") {
+      sendError(res, 409, {
+        code: "CONFLICT",
+        message: "An event with this event_id already exists",
+        details: { fields: err.meta?.target ?? ["event_id"] },
+      });
+      return;
+    }
+
+    console.error("Prisma request error:", err.code);
+    sendError(res, 500, {
+      code: "INTERNAL_ERROR",
+      message: "An unexpected error occurred",
+    });
+    return;
+  }
+
+  if (
+    err instanceof Prisma.PrismaClientInitializationError ||
+    err instanceof Prisma.PrismaClientRustPanicError ||
+    err instanceof Prisma.PrismaClientUnknownRequestError
+  ) {
+    console.error("Prisma error:", err.message);
+    sendError(res, 500, {
+      code: "INTERNAL_ERROR",
+      message: "An unexpected error occurred",
     });
     return;
   }
