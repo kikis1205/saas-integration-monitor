@@ -6,6 +6,8 @@ Minimal webhook API for a SaaS integration monitoring portfolio project.
 
 - `GET /health` — service health check
 - `POST /api/v1/webhooks/events` — validate a webhook event, **persist** it, then return the created resource
+- `GET /api/v1/events` — list stored events (newest `received_at` first; default limit **20**, max **100**)
+- `GET /api/v1/events/:id` — fetch one event by **internal** cuid `id`
 
 Events are stored locally in Postgres. This API does **not** forward or deliver events to external systems.
 
@@ -137,6 +139,28 @@ Invoke-WebRequest -Uri http://localhost:3000/api/v1/webhooks/events -Method Post
 
 Expect **400** with `code: INVALID_JSON`.
 
+### List events (newest first)
+
+```powershell
+# Default limit 20
+Invoke-RestMethod -Uri http://localhost:3000/api/v1/events -Method Get
+
+# Custom limit (1–100)
+Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events?limit=5" -Method Get
+```
+
+Invalid `limit` (missing integer, `0`, or over 100) → **400** `code: VALIDATION_ERROR`.
+
+### Get event by internal id
+
+```powershell
+# After a successful POST, use the returned `id` (cuid), not `event_id`
+$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body $body
+Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)" -Method Get
+```
+
+Unknown id → **404** `code: NOT_FOUND`.
+
 ## Project layout
 
 ```
@@ -147,7 +171,7 @@ src/
   index.ts                 # process entry — fail-fast DB check, binds PORT
   app.ts                   # Express app, routes
   db/prisma.ts             # PrismaClient singleton
-  services/events.ts       # createEvent persistence
+  services/events.ts       # createEvent / listEvents / getEventById
   schemas/webhookEvent.ts  # Zod validation schema
   middleware/errorHandler.ts
 docker-compose.yml         # local Postgres 16 only
