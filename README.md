@@ -96,6 +96,35 @@ npm run build
 npm start
 ```
 
+## Tests
+
+API tests use **Vitest** + **Supertest** against **real Postgres** via `DATABASE_URL` (the local Docker `sim-postgres` service). They are **not** unit tests with an in-memory DB.
+
+**Prerequisites before `npm test`:**
+
+1. Docker Desktop running and Postgres up: `docker compose up -d`
+2. Local `.env` with `DATABASE_URL` (copy from `.env.example` if needed)
+3. Migrations applied (`npm run prisma:migrate` or `npx prisma migrate deploy`)
+
+Do **not** point `DATABASE_URL` at a production database. Tests create rows and delete them afterward by `id` / `event_id`.
+
+```powershell
+cd C:\Users\kikis\Cursor\saas-integration-monitor
+docker compose up -d
+docker compose ps
+
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+npm install
+npm run prisma:generate
+npx prisma migrate deploy
+
+npm test
+# optional watch mode while iterating:
+# npm run test:watch
+```
+
+If `DATABASE_URL` is missing, the test setup **fails fast** with a clear error (same idea as app startup).
+
 ## Example requests
 
 ### Health
@@ -169,11 +198,15 @@ prisma/
   migrations/              # SQL migrations
 src/
   index.ts                 # process entry — fail-fast DB check, binds PORT
-  app.ts                   # Express app, routes
+  app.ts                   # Express app, routes (export createApp for tests)
   db/prisma.ts             # PrismaClient singleton
   services/events.ts       # createEvent / listEvents / getEventById
   schemas/webhookEvent.ts  # Zod validation schema
   middleware/errorHandler.ts
+tests/
+  setup.ts                 # load .env; fail-fast without DATABASE_URL
+  events.test.ts           # Vitest + Supertest API coverage
+vitest.config.ts           # Node test runner config
 docker-compose.yml         # local Postgres 16 only
 .env.example               # DATABASE_URL + PORT placeholders
 ```
