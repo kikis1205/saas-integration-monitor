@@ -1,16 +1,7 @@
-// Milestone 2 Step 1 — schema + tooling only.
-// API routes / POST persistence / GET / tests / fail-fast are Steps 2–5 (not this PR).
-//
-// Locked decisions for later steps (do NOT implement here):
-// - POST success: 201 + resource body (not current 202 ack)
-// - Duplicate event_id: 409
-// - GET by internal id; list default/max limit 20
-// - Tests: Vitest + supertest
-// - Fail-fast on missing DATABASE_URL / no DB connectivity at process start
-//
 // payload = complete validated webhook JSON body
 // (event_id, event_type, occurred_at, data) — not only `data`.
-// No status / delivery fields in M2.
+// Status / attempt fields: Milestone 3 Step 1 (response mapping only;
+// process endpoint / stub / retries are later steps).
 
 generator client {
   provider = "prisma-client-js"
@@ -19,6 +10,13 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+enum EventStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
 }
 
 model Event {
@@ -30,5 +28,12 @@ model Event {
   payload    Json
   receivedAt DateTime @default(now()) @map("received_at")
 
+  status        EventStatus @default(PENDING)
+  attemptCount  Int         @default(0) @map("attempt_count")
+  lastError     String?     @map("last_error")
+  lastAttemptAt DateTime?   @map("last_attempt_at")
+  processedAt   DateTime?   @map("processed_at")
+
+  @@index([status])
   @@map("events")
 }

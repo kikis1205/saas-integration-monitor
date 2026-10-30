@@ -42,5 +42,10 @@ export function toEventResponse(row: Event) {
     occurred_at: row.occurredAt.toISOString(),
     payload: row.payload,
     received_at: row.receivedAt.toISOString(),
+    status: row.status,
+    attempt_count: row.attemptCount,
+    last_error: row.lastError,
+    last_attempt_at: row.lastAttemptAt?.toISOString() ?? null,
+    processed_at: row.processedAt?.toISOString() ?? null,
   };
 }

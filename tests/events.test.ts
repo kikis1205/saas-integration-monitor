@@ -68,6 +68,11 @@ describe("POST /api/v1/webhooks/events", () => {
       event_type: "invoice.paid",
       occurred_at: "2026-03-20T12:00:00.000Z",
       payload: body,
+      status: "PENDING",
+      attempt_count: 0,
+      last_error: null,
+      last_attempt_at: null,
+      processed_at: null,
     });
     expect(typeof res.body.id).toBe("string");
     expect(typeof res.body.received_at).toBe("string");
@@ -77,6 +82,8 @@ describe("POST /api/v1/webhooks/events", () => {
     expect(row).not.toBeNull();
     expect(row?.eventId).toBe(eventId);
     expect(row?.eventType).toBe("invoice.paid");
+    expect(row?.status).toBe("PENDING");
+    expect(row?.attemptCount).toBe(0);
   });
 
   it("rejects duplicate event_id → 409 CONFLICT", async () => {
@@ -119,9 +126,16 @@ describe("GET /api/v1/events", () => {
 
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
-    expect(res.body.some((row: { id: string }) => row.id === created.body.id)).toBe(
-      true,
-    );
+    const listed = res.body.find((row: { id: string }) => row.id === created.body.id);
+    expect(listed).toMatchObject({
+      id: created.body.id,
+      event_id: eventId,
+      status: "PENDING",
+      attempt_count: 0,
+      last_error: null,
+      last_attempt_at: null,
+      processed_at: null,
+    });
   });
 });
 
@@ -141,6 +155,11 @@ describe("GET /api/v1/events/:id", () => {
       id: created.body.id,
       event_id: eventId,
       event_type: "invoice.paid",
+      status: "PENDING",
+      attempt_count: 0,
+      last_error: null,
+      last_attempt_at: null,
+      processed_at: null,
     });
   });
 
