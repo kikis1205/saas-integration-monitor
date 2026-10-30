@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/app";
 import { prisma } from "../src/db/prisma";
+import { MAX_ATTEMPTS } from "../src/services/events";
 
 /**
  * Integration tests against real Postgres (DATABASE_URL / Docker sim-postgres).
@@ -27,12 +28,12 @@ function uniqueEventId(suffix: string): string {
   return `evt_test_${suffix}_${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
 }
 
-function validBody(eventId: string) {
+function validBody(eventId: string, data: Record<string, unknown> = { amount: 42, currency: "USD" }) {
   return {
     event_id: eventId,
     event_type: "invoice.paid",
     occurred_at: "2026-03-20T12:00:00.000Z",
-    data: { amount: 42, currency: "USD" },
+    data,
   };
 }
 
@@ -173,5 +174,141 @@ describe("GET /api/v1/events/:id", () => {
       code: "NOT_FOUND",
       message: "Event not found",
     });
+  });
+});
+
+describe("POST /api/v1/events/:id/process", () => {
+  it("processes a PENDING event → 200 SUCCEEDED", async () => {
+    const eventId = uniqueEventId("proc_ok");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id: created.body.id,
+      status: "SUCCEEDED",
+      attempt_count: 1,
+      last_error: null,
+    });
+    expect(typeof res.body.processed_at).toBe("string");
+    expect(typeof res.body.last_attempt_at).toBe("string");
+  });
+
+  it("stub force_fail → 200 FAILED with last_error", async () => {
+    const eventId = uniqueEventId("proc_fail");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId, { force_fail: true }));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id: created.body.id,
+      status: "FAILED",
+      attempt_count: 1,
+      processed_at: null,
+    });
+    expect(typeof res.body.last_error).toBe("string");
+    expect(res.body.last_error.length).toBeGreaterThan(0);
+  });
+
+  it("already SUCCEEDED → 200 idempotent no-op (attempt_count unchanged)", async () => {
+    const eventId = uniqueEventId("proc_idem");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    const first = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(first.status).toBe(200);
+    expect(first.body.status).toBe("SUCCEEDED");
+    expect(first.body.attempt_count).toBe(1);
+
+    const second = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({
+      status: "SUCCEEDED",
+      attempt_count: 1,
+      processed_at: first.body.processed_at,
+    });
+  });
+
+  it("unknown id → 404 NOT_FOUND", async () => {
+    const res = await request(app).post(
+      "/api/v1/events/cmmissing00000000000000000/process",
+    );
+
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({
+      code: "NOT_FOUND",
+      message: "Event not found",
+    });
+  });
+
+  it("retry after fail then succeed when force_fail cleared", async () => {
+    const eventId = uniqueEventId("proc_retry");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId, { force_fail: true }));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    const failed = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(failed.status).toBe(200);
+    expect(failed.body.status).toBe("FAILED");
+    expect(failed.body.attempt_count).toBe(1);
+
+    await prisma.event.update({
+      where: { id: created.body.id },
+      data: {
+        payload: validBody(eventId, { amount: 1, currency: "USD" }),
+      },
+    });
+
+    const ok = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(ok.status).toBe(200);
+    expect(ok.body).toMatchObject({
+      status: "SUCCEEDED",
+      attempt_count: 2,
+      last_error: null,
+    });
+    expect(typeof ok.body.processed_at).toBe("string");
+  });
+
+  it("exhausted retries → 409 PROCESSING_EXHAUSTED", async () => {
+    const eventId = uniqueEventId("proc_exh");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId, { force_fail: true }));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    for (let i = 1; i <= MAX_ATTEMPTS; i++) {
+      const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("FAILED");
+      expect(res.body.attempt_count).toBe(i);
+    }
+
+    const exhausted = await request(app).post(
+      `/api/v1/events/${created.body.id}/process`,
+    );
+    expect(exhausted.status).toBe(409);
+    expect(exhausted.body).toMatchObject({
+      code: "PROCESSING_EXHAUSTED",
+    });
+
+    const row = await prisma.event.findUnique({ where: { id: created.body.id } });
+    expect(row?.status).toBe("FAILED");
+    expect(row?.attemptCount).toBe(MAX_ATTEMPTS);
   });
 });

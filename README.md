@@ -1,6 +1,6 @@
 # saas-integration-monitor
 
-Portfolio webhook API for **SaaS integration monitoring / support engineering**: accept vendor webhooks, validate them, persist them, and inspect what arrived — the kind of plumbing that sits behind “why didn’t that invoice sync?” tickets.
+Portfolio webhook API for **SaaS integration monitoring / support engineering**: accept vendor webhooks, validate them, persist them, inspect what arrived, and run an **on-demand local process stub** — the kind of plumbing that sits behind “why didn’t that invoice sync?” tickets.
 
 Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 
@@ -10,18 +10,52 @@ Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 |-----------|-----------|
 | **1** | Express `GET /health`; Zod-validated `POST /api/v1/webhooks/events` |
 | **2** | Postgres + Prisma persistence; `GET` list / get-by-id; Vitest + Supertest against real Postgres |
-| **3 (in progress)** | Event `status` + attempt fields on create/list/get responses (processing endpoint not shipped yet) |
+| **3 (in progress)** | Event `status` + attempts; `POST /api/v1/events/:id/process` with local stub + retries (max 3) |
 
-**Not yet:** process endpoint, n8n delivery, auth, dashboard, retries / queues.
+**Not yet:** n8n / external delivery, auth, dashboard, queues / workers, stuck-`PROCESSING` reclaim.
 
-Events stay in local Postgres. This API does **not** forward them to external systems.
+Webhook ingest still only validates and persists. Processing is a **separate** step. The process handler is an **in-process stub** (deterministic success/fail from payload) — it does **not** call n8n or any external system.
+
+## Event status lifecycle
+
+```
+(create) → PENDING ──claim──► PROCESSING ──ok──► SUCCEEDED (terminal)
+                                  │
+                                  └──fail──► FAILED ──claim if attempts < 3──┘
+                                                │
+                                                └── attempts ≥ 3 → terminal FAILED
+```
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `PENDING` \| `PROCESSING` \| `SUCCEEDED` \| `FAILED` |
+| `attempt_count` | Incremented on each successful **claim** (entering `PROCESSING`) |
+| `last_error` | Truncated stub error when `FAILED`; cleared on success |
+| `last_attempt_at` | When the latest claim started |
+| `processed_at` | Set when `SUCCEEDED`; otherwise null |
+
+Constant: `MAX_ATTEMPTS = 3` (includes the first try). Retries are **on-demand** (call process again) — no backoff scheduler.
+
+**Known limitation:** if the process dies while `status` is `PROCESSING`, the row can stick. No reclaim sweeper in this milestone.
 
 ## API (today)
 
 - `GET /health` — service health check
-- `POST /api/v1/webhooks/events` — validate, **persist**, return created resource (**201**; duplicate `event_id` → **409**)
+- `POST /api/v1/webhooks/events` — validate, **persist**, return created resource (**201**; duplicate `event_id` → **409**); new rows are `PENDING` / `attempt_count: 0`
 - `GET /api/v1/events` — list (newest `received_at` first; default limit **20**, max **100**)
 - `GET /api/v1/events/:id` — fetch by **internal** cuid `id` (not vendor `event_id`)
+- `POST /api/v1/events/:id/process` — claim → **local stub** → `SUCCEEDED` or `FAILED`
+
+### Process endpoint codes
+
+| HTTP | When |
+|------|------|
+| **200** | Stub succeeded → `SUCCEEDED`; or already `SUCCEEDED` (idempotent no-op) |
+| **200** | Stub failed this attempt → body `status: "FAILED"` (inspect body) |
+| **404** | Unknown id (`NOT_FOUND`) |
+| **409** | Already `PROCESSING` (`PROCESSING_IN_PROGRESS`) or retries exhausted (`PROCESSING_EXHAUSTED`) |
+
+**Stub rule:** if stored `payload.data.force_fail === true`, the attempt fails; otherwise it succeeds. No network calls.
 
 ## Prerequisites
 
@@ -44,6 +78,8 @@ Copy-Item .env.example .env
 # Defaults match compose (user/password/db: sim). Edit only if you changed credentials.
 # .env is gitignored — never commit secrets.
 
+# If `npm run dev` is already listening on :3000, stop it before `prisma generate`
+# on Windows — otherwise you may hit EPERM locking `query_engine-windows.dll.node`.
 npm run prisma:generate
 npm run prisma:migrate
 # First migrate: when prompted for a name, use e.g. init_events
@@ -114,6 +150,41 @@ Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post
 
 Expect **201** with `id`, `event_id`, `event_type`, `occurred_at`, `payload`, `received_at`, plus status fields (`status: "PENDING"`, `attempt_count: 0`, `last_error` / `last_attempt_at` / `processed_at` null). List and get responses include the same status fields.
 
+### Process → SUCCEEDED (local stub)
+
+```powershell
+$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
+  event_id    = "evt_proc_ok_$(Get-Random)"
+  event_type  = "invoice.paid"
+  occurred_at = "2026-03-20T12:00:00.000Z"
+  data        = @{ amount = 42; currency = "USD" }
+} | ConvertTo-Json)
+
+$processed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
+$processed.status          # SUCCEEDED
+$processed.attempt_count   # 1
+$processed.processed_at    # ISO timestamp
+```
+
+### Process with `force_fail` → FAILED
+
+```powershell
+$failBody = @{
+  event_id    = "evt_proc_fail_$(Get-Random)"
+  event_type  = "invoice.paid"
+  occurred_at = "2026-03-20T12:00:00.000Z"
+  data        = @{ force_fail = $true }
+} | ConvertTo-Json
+
+$failedCreate = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body $failBody
+$failed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($failedCreate.id)/process" -Method Post
+$failed.status        # FAILED
+$failed.attempt_count # 1
+$failed.last_error    # stub message
+```
+
+Calling process again on a retryable `FAILED` event claims another attempt (until `attempt_count` reaches 3). Already-`SUCCEEDED` process calls return **200** with the same row (no-op).
+
 ### Duplicate `event_id` → 409
 
 Same `event_id` again → **409** `code: CONFLICT`.
@@ -148,7 +219,8 @@ src/
   index.ts               # entry — fail-fast DB check, bind PORT
   app.ts                 # Express + routes (createApp for tests)
   db/prisma.ts           # PrismaClient singleton
-  services/events.ts     # create / list / get
+  services/events.ts     # create / list / get / process (claim + mark)
+  services/processStub.ts # pure local stub (force_fail)
   schemas/webhookEvent.ts
   middleware/errorHandler.ts
 tests/                   # Vitest + Supertest
