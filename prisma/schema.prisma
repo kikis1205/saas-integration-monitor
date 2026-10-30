@@ -1,7 +1,7 @@
 // payload = complete validated webhook JSON body
 // (event_id, event_type, occurred_at, data) — not only `data`.
-// Status / attempt fields: Milestone 3 Step 1 (response mapping only;
-// process endpoint / stub / retries are later steps).
+// Status / attempt fields: Milestone 3.
+// Process endpoint + local stub: Step 2 (no n8n / queue).
 
 generator client {
   provider = "prisma-client-js"

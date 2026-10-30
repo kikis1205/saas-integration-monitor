@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import type { ErrorRequestHandler, RequestHandler } from "express";
+import { ProcessEventError } from "../services/events";
 
 type ErrorBody = {
   code: string;
@@ -39,6 +40,15 @@ function isBodyTooLargeError(err: unknown): boolean {
 
 /** Catch-all for unexpected failures. Never expose stack traces or SQL to clients. */
 export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  if (err instanceof ProcessEventError) {
+    if (err.code === "NOT_FOUND") {
+      sendError(res, 404, { code: err.code, message: err.message });
+      return;
+    }
+    sendError(res, 409, { code: err.code, message: err.message });
+    return;
+  }
+
   if (isMalformedJsonError(err)) {
     sendError(res, 400, {
       code: "INVALID_JSON",
