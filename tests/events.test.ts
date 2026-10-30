@@ -311,4 +311,49 @@ describe("POST /api/v1/events/:id/process", () => {
     expect(row?.status).toBe("FAILED");
     expect(row?.attemptCount).toBe(MAX_ATTEMPTS);
   });
+
+  it("concurrent process claims → one winner; final status not corrupted", async () => {
+    const eventId = uniqueEventId("proc_race");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    const path = `/api/v1/events/${created.body.id}/process`;
+    const [a, b] = await Promise.all([
+      request(app).post(path),
+      request(app).post(path),
+    ]);
+
+    const outcomes = [
+      { status: a.status, body: a.body },
+      { status: b.status, body: b.body },
+    ];
+    const oks = outcomes.filter((o) => o.status === 200);
+    const conflicts = outcomes.filter((o) => o.status === 409);
+
+    // Winner: 200 SUCCEEDED. Loser: 409 in-flight, or 200 idempotent no-op if peer already finished.
+    expect(oks.length).toBeGreaterThanOrEqual(1);
+    expect(oks.length + conflicts.length).toBe(2);
+
+    for (const ok of oks) {
+      expect(ok.body).toMatchObject({
+        status: "SUCCEEDED",
+        attempt_count: 1,
+        last_error: null,
+      });
+      expect(typeof ok.body.processed_at).toBe("string");
+    }
+
+    for (const conflict of conflicts) {
+      expect(conflict.body.code).toBe("PROCESSING_IN_PROGRESS");
+    }
+
+    const row = await prisma.event.findUnique({ where: { id: created.body.id } });
+    expect(row?.status).toBe("SUCCEEDED");
+    expect(row?.attemptCount).toBe(1);
+    expect(row?.lastError).toBeNull();
+    expect(row?.processedAt).not.toBeNull();
+  });
 });

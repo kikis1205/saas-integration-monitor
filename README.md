@@ -10,7 +10,7 @@ Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 |-----------|-----------|
 | **1** | Express `GET /health`; Zod-validated `POST /api/v1/webhooks/events` |
 | **2** | Postgres + Prisma persistence; `GET` list / get-by-id; Vitest + Supertest against real Postgres |
-| **3 (in progress)** | Event `status` + attempts; `POST /api/v1/events/:id/process` with local stub + retries (max 3) |
+| **3** | Event `status` + attempts; on-demand `POST /api/v1/events/:id/process`; local stub; retries up to `MAX_ATTEMPTS = 3`; exhaust → 409; idempotent `SUCCEEDED` |
 
 **Not yet:** n8n / external delivery, auth, dashboard, queues / workers, stuck-`PROCESSING` reclaim.
 
@@ -184,6 +184,54 @@ $failed.last_error    # stub message
 ```
 
 Calling process again on a retryable `FAILED` event claims another attempt (until `attempt_count` reaches 3). Already-`SUCCEEDED` process calls return **200** with the same row (no-op).
+
+### Retry after fail → SUCCEEDED
+
+Demo path: fail once with `force_fail`, clear that flag on the stored payload, process again.
+
+```powershell
+$retryId = "evt_retry_$(Get-Random)"
+$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
+  event_id    = $retryId
+  event_type  = "invoice.paid"
+  occurred_at = "2026-03-20T12:00:00.000Z"
+  data        = @{ force_fail = $true }
+} | ConvertTo-Json)
+
+$failed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
+$failed.status        # FAILED
+$failed.attempt_count # 1
+
+# Clear force_fail on the stored payload (demo / test helper — not a public API).
+# Prefer Prisma here: docker/psql JSON quoting is fragile under Windows PowerShell.
+$env:EVENT_ID = $created.id
+node -e "require('dotenv').config(); const {PrismaClient}=require('@prisma/client'); const p=new PrismaClient(); p.event.update({where:{id:process.env.EVENT_ID}, data:{payload:{event_id:'cleared', event_type:'invoice.paid', occurred_at:'2026-03-20T12:00:00.000Z', data:{amount:1, currency:'USD'}}}}).then(()=>p.`$disconnect());"
+
+$ok = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
+$ok.status        # SUCCEEDED
+$ok.attempt_count # 2
+$ok.last_error    # null
+```
+
+### Exhaust retries → 409 `PROCESSING_EXHAUSTED`
+
+```powershell
+$exhId = "evt_exh_$(Get-Random)"
+$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
+  event_id    = $exhId
+  event_type  = "invoice.paid"
+  occurred_at = "2026-03-20T12:00:00.000Z"
+  data        = @{ force_fail = $true }
+} | ConvertTo-Json)
+
+1..3 | ForEach-Object {
+  $r = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
+  "$($r.status) attempt=$($r.attempt_count)"
+}
+
+# Fourth call → 409 PROCESSING_EXHAUSTED (curl shows status + body clearly)
+curl.exe -s -i -X POST "http://localhost:3000/api/v1/events/$($created.id)/process"
+```
 
 ### Duplicate `event_id` → 409
 
