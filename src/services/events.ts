@@ -132,10 +132,43 @@ function truncateError(message: string): string {
   return message.slice(0, LAST_ERROR_MAX_LEN);
 }
 
+function isClaimable(row: Event): boolean {
+  return (
+    row.status === EventStatus.PENDING ||
+    (row.status === EventStatus.FAILED && row.attemptCount < MAX_ATTEMPTS)
+  );
+}
+
+/**
+ * Classify a failed claim after re-reading the row.
+ * Retryable PENDING/FAILED is not an error — caller may re-claim.
+ */
+function classifyUnclaimed(row: Event | null): "not_found" | "succeeded" | "retryable" | "in_progress" | "exhausted" {
+  if (!row) {
+    return "not_found";
+  }
+  if (row.status === EventStatus.SUCCEEDED) {
+    return "succeeded";
+  }
+  if (isClaimable(row)) {
+    return "retryable";
+  }
+  if (row.status === EventStatus.PROCESSING) {
+    return "in_progress";
+  }
+  if (row.status === EventStatus.FAILED && row.attemptCount >= MAX_ATTEMPTS) {
+    return "exhausted";
+  }
+  return "in_progress";
+}
+
 /**
  * Claim → run local stub → SUCCEEDED or FAILED.
  * Already-SUCCEEDED → idempotent no-op (same row).
  * Throws ProcessEventError for missing / in-flight / exhausted.
+ *
+ * If a peer finishes between our lost claim and re-read, leaving the row
+ * claimable again (PENDING or retryable FAILED), we re-claim once.
  */
 export async function processEvent(id: string): Promise<Event> {
   const existing = await getEventById(id);
@@ -147,25 +180,33 @@ export async function processEvent(id: string): Promise<Event> {
     return existing;
   }
 
-  const claimed = await claimEventForProcessing(id);
+  let claimed = await claimEventForProcessing(id);
+
   if (!claimed) {
     const again = await getEventById(id);
-    if (!again) {
+    const kind = classifyUnclaimed(again);
+    if (kind === "not_found") {
       throw new ProcessEventError("NOT_FOUND", "Event not found");
     }
-    if (again.status === EventStatus.SUCCEEDED) {
-      return again;
+    if (kind === "succeeded") {
+      return again as Event;
     }
-    if (again.status === EventStatus.PROCESSING) {
-      throw new ProcessEventError(
-        "PROCESSING_IN_PROGRESS",
-        "Event is already being processed",
-      );
+    if (kind === "retryable") {
+      // Lost a race to a peer that already finished; row is claimable again.
+      claimed = await claimEventForProcessing(id);
     }
-    if (
-      again.status === EventStatus.FAILED &&
-      again.attemptCount >= MAX_ATTEMPTS
-    ) {
+  }
+
+  if (!claimed) {
+    const again = await getEventById(id);
+    const kind = classifyUnclaimed(again);
+    if (kind === "not_found") {
+      throw new ProcessEventError("NOT_FOUND", "Event not found");
+    }
+    if (kind === "succeeded") {
+      return again as Event;
+    }
+    if (kind === "exhausted") {
       throw new ProcessEventError(
         "PROCESSING_EXHAUSTED",
         `Event has reached the maximum of ${MAX_ATTEMPTS} processing attempts`,
@@ -173,7 +214,7 @@ export async function processEvent(id: string): Promise<Event> {
     }
     throw new ProcessEventError(
       "PROCESSING_IN_PROGRESS",
-      "Event could not be claimed for processing",
+      "Event is already being processed",
     );
   }
 
