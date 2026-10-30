@@ -10,8 +10,9 @@ Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 |-----------|-----------|
 | **1** | Express `GET /health`; Zod-validated `POST /api/v1/webhooks/events` |
 | **2** | Postgres + Prisma persistence; `GET` list / get-by-id; Vitest + Supertest against real Postgres |
+| **3 (in progress)** | Event `status` + attempt fields on create/list/get responses (processing endpoint not shipped yet) |
 
-**Not yet:** n8n delivery, auth, dashboard, retries / queues.
+**Not yet:** process endpoint, n8n delivery, auth, dashboard, retries / queues.
 
 Events stay in local Postgres. This API does **not** forward them to external systems.
 
@@ -111,7 +112,7 @@ $body = @{
 Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body $body
 ```
 
-Expect **201** with `id`, `event_id`, `event_type`, `occurred_at`, `payload`, `received_at`.
+Expect **201** with `id`, `event_id`, `event_type`, `occurred_at`, `payload`, `received_at`, plus status fields (`status: "PENDING"`, `attempt_count: 0`, `last_error` / `last_attempt_at` / `processed_at` null). List and get responses include the same status fields.
 
 ### Duplicate `event_id` → 409
 
