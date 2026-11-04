@@ -1,8 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/app";
+import { DEFAULT_PROCESSING_STALE_MS } from "../src/config/processing";
 import { prisma } from "../src/db/prisma";
-import { MAX_ATTEMPTS } from "../src/services/events";
+import {
+  MAX_ATTEMPTS,
+  markEventFailed,
+  markEventSucceeded,
+} from "../src/services/events";
 
 /**
  * Integration tests against real Postgres (DATABASE_URL / Docker sim-postgres).
@@ -21,9 +26,27 @@ const DELIVERY_ENV_KEYS = [
   "DELIVERY_WEBHOOK_URL",
   "DELIVERY_TIMEOUT_MS",
   "DELIVERY_WEBHOOK_SECRET",
+  "PROCESSING_STALE_MS",
 ] as const;
 
 const savedDeliveryEnv: Record<string, string | undefined> = {};
+
+/** Plant a stuck PROCESSING row with a backdated lastAttemptAt (avoids real 5m waits). */
+async function plantStuckProcessing(
+  id: string,
+  opts: { attemptCount: number; staleMsAgo: number },
+): Promise<void> {
+  await prisma.event.update({
+    where: { id },
+    data: {
+      status: "PROCESSING",
+      attemptCount: opts.attemptCount,
+      lastAttemptAt: new Date(Date.now() - opts.staleMsAgo),
+      lastError: null,
+      processedAt: null,
+    },
+  });
+}
 
 /** Track rows this file created so cleanup is precise. */
 const createdIds: string[] = [];
@@ -438,5 +461,214 @@ describe("POST /api/v1/events/:id/process", () => {
     expect(row?.attemptCount).toBe(1);
     expect(row?.lastError).toBeNull();
     expect(row?.processedAt).not.toBeNull();
+  });
+
+  it("fresh PROCESSING → 409 PROCESSING_IN_PROGRESS (no reclaim, no fetch)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_fresh");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    await plantStuckProcessing(created.body.id, {
+      attemptCount: 1,
+      staleMsAgo: 1_000, // well under default 300_000
+    });
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "PROCESSING_IN_PROGRESS" });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const row = await prisma.event.findUnique({ where: { id: created.body.id } });
+    expect(row?.status).toBe("PROCESSING");
+    expect(row?.attemptCount).toBe(1);
+  });
+
+  it("stale PROCESSING reclaims → SUCCEEDED and bumps attempt", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_stale_ok");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    await plantStuckProcessing(created.body.id, {
+      attemptCount: 1,
+      staleMsAgo: DEFAULT_PROCESSING_STALE_MS + 60_000,
+    });
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      status: "SUCCEEDED",
+      attempt_count: 2,
+      last_error: null,
+    });
+    expect(typeof res.body.processed_at).toBe("string");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("stale PROCESSING + delivery fail → FAILED with bumped attempt", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(500));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_stale_fail");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    await plantStuckProcessing(created.body.id, {
+      attemptCount: 1,
+      staleMsAgo: DEFAULT_PROCESSING_STALE_MS + 60_000,
+    });
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      status: "FAILED",
+      attempt_count: 2,
+      processed_at: null,
+    });
+    expect(res.body.last_error).toContain("500");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("stale PROCESSING + attemptCount >= MAX → 409 exhausted, no HTTP, terminal FAILED", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_stale_exh");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    await plantStuckProcessing(created.body.id, {
+      attemptCount: MAX_ATTEMPTS,
+      staleMsAgo: DEFAULT_PROCESSING_STALE_MS + 60_000,
+    });
+
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: "PROCESSING_EXHAUSTED" });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const row = await prisma.event.findUnique({ where: { id: created.body.id } });
+    expect(row?.status).toBe("FAILED");
+    expect(row?.attemptCount).toBe(MAX_ATTEMPTS);
+    expect(row?.lastError).toContain("Stale PROCESSING after max attempts");
+
+    // Further process stays exhausted (no reclaim forever).
+    const again = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe("PROCESSING_EXHAUSTED");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("concurrent process on stale PROCESSING → one delivery; coherent final status", async () => {
+    let release!: (value: Response) => void;
+    const gate = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation(() => gate);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_stale_race");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    await plantStuckProcessing(created.body.id, {
+      attemptCount: 1,
+      staleMsAgo: DEFAULT_PROCESSING_STALE_MS + 60_000,
+    });
+
+    const path = `/api/v1/events/${created.body.id}/process`;
+    const pending = Promise.all([request(app).post(path), request(app).post(path)]);
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    release(jsonResponse(200));
+
+    const [a, b] = await pending;
+    const outcomes = [
+      { status: a.status, body: a.body },
+      { status: b.status, body: b.body },
+    ];
+    const oks = outcomes.filter((o) => o.status === 200);
+    const conflicts = outcomes.filter((o) => o.status === 409);
+
+    expect(oks.length).toBeGreaterThanOrEqual(1);
+    expect(oks.length + conflicts.length).toBe(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    for (const ok of oks) {
+      expect(ok.body).toMatchObject({
+        status: "SUCCEEDED",
+        attempt_count: 2,
+        last_error: null,
+      });
+    }
+    for (const conflict of conflicts) {
+      expect(conflict.body.code).toBe("PROCESSING_IN_PROGRESS");
+    }
+
+    const row = await prisma.event.findUnique({ where: { id: created.body.id } });
+    expect(row?.status).toBe("SUCCEEDED");
+    expect(row?.attemptCount).toBe(2);
+    expect(row?.processedAt).not.toBeNull();
+  });
+
+  it("late mark with stale attemptCount is a no-op (guard)", async () => {
+    const eventId = uniqueEventId("proc_late_mark");
+    const created = await request(app)
+      .post("/api/v1/webhooks/events")
+      .send(validBody(eventId));
+    expect(created.status).toBe(201);
+    track(created.body);
+
+    // Simulate reclaim: attempt 2 owns PROCESSING.
+    await prisma.event.update({
+      where: { id: created.body.id },
+      data: {
+        status: "PROCESSING",
+        attemptCount: 2,
+        lastAttemptAt: new Date(),
+      },
+    });
+
+    // Old flight (attempt 1) tries to mark — must not clobber.
+    const afterOldSuccess = await markEventSucceeded(created.body.id, 1);
+    expect(afterOldSuccess.status).toBe("PROCESSING");
+    expect(afterOldSuccess.attemptCount).toBe(2);
+
+    const afterOldFail = await markEventFailed(created.body.id, "late zombie", 1);
+    expect(afterOldFail.status).toBe("PROCESSING");
+    expect(afterOldFail.attemptCount).toBe(2);
+    expect(afterOldFail.lastError).toBeNull();
+
+    // Current attempt still wins.
+    const won = await markEventSucceeded(created.body.id, 2);
+    expect(won.status).toBe("SUCCEEDED");
+    expect(won.attemptCount).toBe(2);
+    expect(won.processedAt).not.toBeNull();
   });
 });

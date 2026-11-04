@@ -1,4 +1,5 @@
 import { EventStatus, Prisma, type Event } from "@prisma/client";
+import { getProcessingConfig } from "../config/processing";
 import { prisma } from "../db/prisma";
 import type { WebhookEvent } from "../schemas/webhookEvent";
 import { deliverWebhook } from "./deliverWebhook";
@@ -10,6 +11,8 @@ export const MAX_LIST_LIMIT = 100;
 export const MAX_ATTEMPTS = 3;
 
 const LAST_ERROR_MAX_LEN = 500;
+
+const STALE_EXHAUSTED_ERROR = "Stale PROCESSING after max attempts";
 
 export type ProcessEventErrorCode =
   | "NOT_FOUND"
@@ -72,13 +75,31 @@ export function toEventResponse(row: Event) {
   };
 }
 
+function staleCutoff(now: Date, staleMs: number): Date {
+  return new Date(now.getTime() - staleMs);
+}
+
+function isStaleProcessing(row: Event, now: Date, staleMs: number): boolean {
+  if (row.status !== EventStatus.PROCESSING || !row.lastAttemptAt) {
+    return false;
+  }
+  return row.lastAttemptAt.getTime() <= now.getTime() - staleMs;
+}
+
 /**
- * Atomically claim a row for processing: PENDING, or FAILED with attempts left.
+ * Atomically claim a row for processing:
+ * - PENDING
+ * - FAILED with attempts left
+ * - stale PROCESSING (lastAttemptAt older than PROCESSING_STALE_MS) with attempts left
+ *
  * Increments attemptCount and sets status=PROCESSING + lastAttemptAt.
  * Returns null when the claim predicate does not match (caller classifies).
  */
 export async function claimEventForProcessing(id: string): Promise<Event | null> {
   const now = new Date();
+  const { staleMs } = getProcessingConfig();
+  const cutoff = staleCutoff(now, staleMs);
+
   const result = await prisma.event.updateMany({
     where: {
       id,
@@ -87,6 +108,11 @@ export async function claimEventForProcessing(id: string): Promise<Event | null>
         {
           status: EventStatus.FAILED,
           attemptCount: { lt: MAX_ATTEMPTS },
+        },
+        {
+          status: EventStatus.PROCESSING,
+          attemptCount: { lt: MAX_ATTEMPTS },
+          lastAttemptAt: { lte: cutoff },
         },
       ],
     },
@@ -104,25 +130,85 @@ export async function claimEventForProcessing(id: string): Promise<Event | null>
   return prisma.event.findUnique({ where: { id } });
 }
 
-export async function markEventSucceeded(id: string): Promise<Event> {
-  return prisma.event.update({
-    where: { id },
+/**
+ * Mark SUCCEEDED only while still PROCESSING for this attempt.
+ * Returns the current row; count=0 (lost race / already reclaimed) → re-read, no throw.
+ */
+export async function markEventSucceeded(
+  id: string,
+  expectedAttemptCount: number,
+): Promise<Event> {
+  await prisma.event.updateMany({
+    where: {
+      id,
+      status: EventStatus.PROCESSING,
+      attemptCount: expectedAttemptCount,
+    },
     data: {
       status: EventStatus.SUCCEEDED,
       processedAt: new Date(),
       lastError: null,
     },
   });
+
+  const row = await prisma.event.findUnique({ where: { id } });
+  if (!row) {
+    throw new Error(`Event ${id} not found after markEventSucceeded`);
+  }
+  return row;
 }
 
-export async function markEventFailed(id: string, errorMessage: string): Promise<Event> {
-  return prisma.event.update({
-    where: { id },
+/**
+ * Mark FAILED only while still PROCESSING for this attempt.
+ * Returns the current row; count=0 (lost race / already reclaimed) → re-read, no throw.
+ */
+export async function markEventFailed(
+  id: string,
+  errorMessage: string,
+  expectedAttemptCount: number,
+): Promise<Event> {
+  await prisma.event.updateMany({
+    where: {
+      id,
+      status: EventStatus.PROCESSING,
+      attemptCount: expectedAttemptCount,
+    },
     data: {
       status: EventStatus.FAILED,
       lastError: truncateError(errorMessage),
     },
   });
+
+  const row = await prisma.event.findUnique({ where: { id } });
+  if (!row) {
+    throw new Error(`Event ${id} not found after markEventFailed`);
+  }
+  return row;
+}
+
+/**
+ * One-shot: stale PROCESSING at max attempts → terminal FAILED (no HTTP, no attempt bump).
+ * Returns the row after the transition (or current row if a peer already moved it).
+ */
+export async function finalizeStaleExhaustedProcessing(id: string): Promise<Event | null> {
+  const now = new Date();
+  const { staleMs } = getProcessingConfig();
+  const cutoff = staleCutoff(now, staleMs);
+
+  await prisma.event.updateMany({
+    where: {
+      id,
+      status: EventStatus.PROCESSING,
+      attemptCount: { gte: MAX_ATTEMPTS },
+      lastAttemptAt: { lte: cutoff },
+    },
+    data: {
+      status: EventStatus.FAILED,
+      lastError: truncateError(STALE_EXHAUSTED_ERROR),
+    },
+  });
+
+  return prisma.event.findUnique({ where: { id } });
 }
 
 function truncateError(message: string): string {
@@ -132,26 +218,47 @@ function truncateError(message: string): string {
   return message.slice(0, LAST_ERROR_MAX_LEN);
 }
 
-function isClaimable(row: Event): boolean {
-  return (
-    row.status === EventStatus.PENDING ||
-    (row.status === EventStatus.FAILED && row.attemptCount < MAX_ATTEMPTS)
-  );
+function isClaimable(row: Event, now: Date, staleMs: number): boolean {
+  if (row.status === EventStatus.PENDING) {
+    return true;
+  }
+  if (row.status === EventStatus.FAILED && row.attemptCount < MAX_ATTEMPTS) {
+    return true;
+  }
+  if (
+    row.status === EventStatus.PROCESSING &&
+    row.attemptCount < MAX_ATTEMPTS &&
+    isStaleProcessing(row, now, staleMs)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
  * Classify a failed claim after re-reading the row.
- * Retryable PENDING/FAILED is not an error — caller may re-claim.
+ * Retryable PENDING/FAILED/stale-PROCESSING is not an error — caller may re-claim.
  */
-function classifyUnclaimed(row: Event | null): "not_found" | "succeeded" | "retryable" | "in_progress" | "exhausted" {
+function classifyUnclaimed(
+  row: Event | null,
+  now: Date,
+  staleMs: number,
+): "not_found" | "succeeded" | "retryable" | "in_progress" | "exhausted" {
   if (!row) {
     return "not_found";
   }
   if (row.status === EventStatus.SUCCEEDED) {
     return "succeeded";
   }
-  if (isClaimable(row)) {
+  if (isClaimable(row, now, staleMs)) {
     return "retryable";
+  }
+  if (
+    row.status === EventStatus.PROCESSING &&
+    row.attemptCount >= MAX_ATTEMPTS &&
+    isStaleProcessing(row, now, staleMs)
+  ) {
+    return "exhausted";
   }
   if (row.status === EventStatus.PROCESSING) {
     return "in_progress";
@@ -168,7 +275,9 @@ function classifyUnclaimed(row: Event | null): "not_found" | "succeeded" | "retr
  * Throws ProcessEventError for missing / in-flight / exhausted.
  *
  * If a peer finishes between our lost claim and re-read, leaving the row
- * claimable again (PENDING or retryable FAILED), we re-claim once.
+ * claimable again (PENDING, retryable FAILED, or stale PROCESSING), we re-claim once.
+ *
+ * Stale PROCESSING with attemptCount >= MAX is finalized to FAILED (no HTTP) then 409.
  */
 export async function processEvent(id: string): Promise<Event> {
   const existing = await getEventById(id);
@@ -180,16 +289,45 @@ export async function processEvent(id: string): Promise<Event> {
     return existing;
   }
 
+  const now = new Date();
+  const { staleMs } = getProcessingConfig();
+
+  // Stale + exhausted: terminalize without claiming / HTTP.
+  if (
+    existing.status === EventStatus.PROCESSING &&
+    existing.attemptCount >= MAX_ATTEMPTS &&
+    isStaleProcessing(existing, now, staleMs)
+  ) {
+    await finalizeStaleExhaustedProcessing(id);
+    throw new ProcessEventError(
+      "PROCESSING_EXHAUSTED",
+      `Event has reached the maximum of ${MAX_ATTEMPTS} processing attempts`,
+    );
+  }
+
   let claimed = await claimEventForProcessing(id);
 
   if (!claimed) {
     const again = await getEventById(id);
-    const kind = classifyUnclaimed(again);
+    const kind = classifyUnclaimed(again, now, staleMs);
     if (kind === "not_found") {
       throw new ProcessEventError("NOT_FOUND", "Event not found");
     }
     if (kind === "succeeded") {
       return again as Event;
+    }
+    if (kind === "exhausted" && again?.status === EventStatus.PROCESSING) {
+      await finalizeStaleExhaustedProcessing(id);
+      throw new ProcessEventError(
+        "PROCESSING_EXHAUSTED",
+        `Event has reached the maximum of ${MAX_ATTEMPTS} processing attempts`,
+      );
+    }
+    if (kind === "exhausted") {
+      throw new ProcessEventError(
+        "PROCESSING_EXHAUSTED",
+        `Event has reached the maximum of ${MAX_ATTEMPTS} processing attempts`,
+      );
     }
     if (kind === "retryable") {
       // Lost a race to a peer that already finished; row is claimable again.
@@ -199,12 +337,19 @@ export async function processEvent(id: string): Promise<Event> {
 
   if (!claimed) {
     const again = await getEventById(id);
-    const kind = classifyUnclaimed(again);
+    const kind = classifyUnclaimed(again, now, staleMs);
     if (kind === "not_found") {
       throw new ProcessEventError("NOT_FOUND", "Event not found");
     }
     if (kind === "succeeded") {
       return again as Event;
+    }
+    if (kind === "exhausted" && again?.status === EventStatus.PROCESSING) {
+      await finalizeStaleExhaustedProcessing(id);
+      throw new ProcessEventError(
+        "PROCESSING_EXHAUSTED",
+        `Event has reached the maximum of ${MAX_ATTEMPTS} processing attempts`,
+      );
     }
     if (kind === "exhausted") {
       throw new ProcessEventError(
@@ -220,9 +365,9 @@ export async function processEvent(id: string): Promise<Event> {
 
   try {
     await deliverWebhook(claimed);
-    return await markEventSucceeded(claimed.id);
+    return await markEventSucceeded(claimed.id, claimed.attemptCount);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown processing error";
-    return await markEventFailed(claimed.id, message);
+    return await markEventFailed(claimed.id, message, claimed.attemptCount);
   }
 }

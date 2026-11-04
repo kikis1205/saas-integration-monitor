@@ -11,9 +11,9 @@ Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 | **1** | Express `GET /health`; Zod-validated `POST /api/v1/webhooks/events` |
 | **2** | Postgres + Prisma persistence; `GET` list / get-by-id; Vitest + Supertest against real Postgres |
 | **3** | Event `status` + attempts; on-demand `POST /api/v1/events/:id/process`; retries up to `MAX_ATTEMPTS = 3`; exhaust → 409; idempotent `SUCCEEDED` |
-| **4** | Process POSTs the stored event JSON to `DELIVERY_WEBHOOK_URL` (native `fetch`); `Idempotency-Key` = `event_id`; timeout / non-2xx / missing URL → `FAILED` + existing retries |
+| **4** | Process POSTs the stored event JSON to `DELIVERY_WEBHOOK_URL` (native `fetch`); `Idempotency-Key` = `event_id`; timeout / non-2xx / missing URL → `FAILED` + existing retries; **stale `PROCESSING` reclaim** on the next process call |
 
-**Not yet:** auth, dashboard, queues / workers, stuck-`PROCESSING` reclaim.
+**Not yet:** auth, dashboard, queues / workers / cron.
 
 Webhook ingest still only validates and persists. Processing is a **separate** on-demand step that **POSTs outbound HTTP** to the configured webhook URL (n8n, webhook.site, etc.). There is **no process stub** and no `force_fail` path — failures come from real delivery outcomes (or mocked `fetch` in tests).
 
@@ -22,11 +22,17 @@ Webhook ingest still only validates and persists. Processing is a **separate** o
 ```
 (create) → PENDING ──claim──► PROCESSING ──HTTP 2xx──► SUCCEEDED (terminal)
                                   │
-                                  └──timeout / network / non-2xx──► FAILED
+                                  ├──timeout / network / non-2xx──► FAILED
+                                  │     │
+                                  │     └── claim again if attempts < 3 ──┘
+                                  │           │
+                                  │           └── attempts ≥ 3 → terminal FAILED
+                                  │
+                                  └── crash mid-flight → stuck PROCESSING
                                         │
-                                        └── claim again if attempts < 3 ──┘
-                                              │
-                                              └── attempts ≥ 3 → terminal FAILED
+                                        └── after PROCESSING_STALE_MS, process again
+                                              reclaims (attempt++) if attempts < 3
+                                              else → terminal FAILED (exhausted)
 ```
 
 | Field | Meaning |
@@ -39,7 +45,17 @@ Webhook ingest still only validates and persists. Processing is a **separate** o
 
 Constant: `MAX_ATTEMPTS = 3` (includes the first try). Retries are **on-demand** (call process again) — no backoff scheduler. **One outbound HTTP attempt per claim**; further tries = hit process again, still bounded by `MAX_ATTEMPTS`.
 
-**Known limitation:** if the process dies while `status` is `PROCESSING`, the row can stick. No reclaim sweeper yet — document and live with it for demos; a later timeout-based reclaim would fix it.
+### Stuck PROCESSING reclaim
+
+If the process dies after a successful claim and before `SUCCEEDED` / `FAILED`, the row stays `PROCESSING`. There is **no** background sweeper — reclaim runs **inside the existing claim** on the next `POST …/process`:
+
+| Situation | Behavior |
+|-----------|----------|
+| Fresh `PROCESSING` (`last_attempt_at` younger than `PROCESSING_STALE_MS`) | **409** `PROCESSING_IN_PROGRESS` |
+| Stale `PROCESSING` + `attempt_count` &lt; `MAX_ATTEMPTS` | Re-claim (bump attempt) → deliver again |
+| Stale `PROCESSING` + `attempt_count` ≥ `MAX_ATTEMPTS` | One-shot → terminal `FAILED` (`last_error` notes stale max attempts); **409** `PROCESSING_EXHAUSTED`; no HTTP |
+
+Success/fail marks are conditional on `status = PROCESSING` **and** the claim’s `attempt_count`, so a late writer from a zombie flight cannot clobber a newer attempt. Delivery remains **at-least-once** — receivers must dedupe on `event_id` / `Idempotency-Key`.
 
 ## Outbound delivery
 
@@ -52,6 +68,7 @@ Constant: `MAX_ATTEMPTS = 3` (includes the first try). Retries are **on-demand**
 | `DELIVERY_WEBHOOK_URL` | Needed to succeed | none | Absolute `http:` / `https:` receiver URL |
 | `DELIVERY_TIMEOUT_MS` | Optional | `5000` | Hard abort for the outbound request |
 | `DELIVERY_WEBHOOK_SECRET` | Optional | unset | When set, sent as `X-Webhook-Secret` |
+| `PROCESSING_STALE_MS` | Optional | `300000` | Age of `last_attempt_at` after which `PROCESSING` may be re-claimed. **Must be ≫ `DELIVERY_TIMEOUT_MS`** so a healthy in-flight delivery is not stolen. Positive integer; invalid → fail at config parse. |
 
 Missing / empty `DELIVERY_WEBHOOK_URL` does **not** crash the server. The attempt fails → `FAILED` with `last_error` like `DELIVERY_WEBHOOK_URL is not configured`. Fix `.env` and process again.
 
@@ -102,9 +119,9 @@ Honesty for interviews: this is **at-least-once** delivery with sender guards ag
 | **200** | Delivery 2xx → `SUCCEEDED`; or already `SUCCEEDED` (idempotent no-op, **no HTTP**) |
 | **200** | Delivery failed this attempt (non-2xx / timeout / network / missing URL) → body `status: "FAILED"` |
 | **404** | Unknown id (`NOT_FOUND`) |
-| **409** | Already `PROCESSING` (`PROCESSING_IN_PROGRESS`) or retries exhausted (`PROCESSING_EXHAUSTED`) |
+| **409** | Fresh (non-stale) `PROCESSING` (`PROCESSING_IN_PROGRESS`) or retries exhausted (`PROCESSING_EXHAUSTED`) |
 
-Automated tests mock `fetch`; they do not hit a real webhook. Soft-fail HTTP semantics: a failed attempt still returns **200** with `status: "FAILED"` — clients must read the body.
+Automated tests mock `fetch`; they do not hit a real webhook. Soft-fail HTTP semantics: a failed attempt still returns **200** with `status: "FAILED"` — clients must read the body. Stale-`PROCESSING` reclaim is covered by planting a backdated `lastAttemptAt` in tests (no real 5-minute wait).
 
 ## Prerequisites
 
@@ -244,6 +261,42 @@ Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($failed.id)/proces
 
 Failure / exhaust / retry paths are also covered by `npm test` (mocked `fetch`). Live smoke against webhook.site is optional visual proof.
 
+### Smoke: stuck PROCESSING reclaim (PowerShell)
+
+Default stale window is **5 minutes**. For a quick local demo, either:
+
+- Set `PROCESSING_STALE_MS=5000` in a throwaway `.env`, restart `npm run dev`, leave a row in `PROCESSING`, wait &gt;5s, then process again; **or**
+- Keep the default threshold and **backdate** `lastAttemptAt` (same technique as the tests):
+
+```powershell
+# $id = internal cuid from ingest / GET
+$id = "cmxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+@'
+const { PrismaClient } = require("@prisma/client");
+const p = new PrismaClient();
+const id = process.argv[1];
+p.event.update({
+  where: { id },
+  data: {
+    status: "PROCESSING",
+    attemptCount: 1,
+    lastAttemptAt: new Date(Date.now() - 400000),
+  },
+})
+  .then((r) => { console.log("backdated", r.id); return p.$disconnect(); })
+  .catch((e) => { console.error(e); process.exit(1); });
+'@ | Set-Content -Encoding utf8 .\tmp-backdate-processing.js
+
+node .\tmp-backdate-processing.js $id
+Remove-Item .\tmp-backdate-processing.js
+
+Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$id/process" -Method Post
+# → reclaim bumps attempt_count, delivers again → SUCCEEDED or FAILED
+```
+
+Prefer `npm test` for the authoritative reclaim cases.
+
 ### Duplicate `event_id` → 409
 
 Same `event_id` again → **409** `code: CONFLICT`.
@@ -278,12 +331,13 @@ src/
   index.ts               # entry — fail-fast DB check, bind PORT
   app.ts                 # Express + routes (createApp for tests)
   config/delivery.ts     # DELIVERY_WEBHOOK_* env parse / http(s) URL check
+  config/processing.ts   # PROCESSING_STALE_MS (stuck PROCESSING reclaim)
   db/prisma.ts           # PrismaClient singleton
-  services/events.ts     # create / list / get / process (claim + deliver + mark)
+  services/events.ts     # create / list / get / process (claim + reclaim + deliver + mark)
   services/deliverWebhook.ts  # outbound fetch POST + Idempotency-Key
   schemas/webhookEvent.ts
   middleware/errorHandler.ts
-tests/                   # Vitest + Supertest (+ fetch mocks for delivery)
+tests/                   # Vitest + Supertest (+ fetch mocks for delivery / reclaim)
 docker-compose.yml       # local Postgres 16
-.env.example             # DATABASE_URL, PORT, delivery placeholders (no secrets)
+.env.example             # DATABASE_URL, PORT, delivery + reclaim placeholders (no secrets)
 ```
