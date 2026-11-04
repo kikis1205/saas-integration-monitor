@@ -131,9 +131,9 @@ export function createApp() {
   });
 
   /**
-   * On-demand process: claim → local stub → SUCCEEDED or FAILED.
-   * Stub only — does not call n8n or any external system.
-   * Already SUCCEEDED → 200 no-op. Soft fail → 200 with status FAILED.
+   * On-demand process: claim → outbound HTTP delivery → SUCCEEDED or FAILED.
+   * POSTs the public event JSON to DELIVERY_WEBHOOK_URL (see deliverWebhook).
+   * Already SUCCEEDED → 200 no-op (no HTTP). Soft fail → 200 with status FAILED.
    * In-flight PROCESSING or exhausted retries → 409.
    */
   app.post("/api/v1/events/:id/process", async (req, res, next) => {
