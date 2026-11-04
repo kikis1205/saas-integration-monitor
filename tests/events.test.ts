@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/app";
 import { prisma } from "../src/db/prisma";
@@ -11,9 +11,19 @@ import { MAX_ATTEMPTS } from "../src/services/events";
  * 1. POST creates a unique event_id
  * 2. Assert HTTP status + body
  * 3. afterEach deletes rows we created (by id / event_id) so runs stay non-flaky
+ *
+ * Process tests mock global `fetch` (outbound delivery) — no real webhook calls.
  */
 
 const app = createApp();
+
+const DELIVERY_ENV_KEYS = [
+  "DELIVERY_WEBHOOK_URL",
+  "DELIVERY_TIMEOUT_MS",
+  "DELIVERY_WEBHOOK_SECRET",
+] as const;
+
+const savedDeliveryEnv: Record<string, string | undefined> = {};
 
 /** Track rows this file created so cleanup is precise. */
 const createdIds: string[] = [];
@@ -37,7 +47,17 @@ function validBody(eventId: string, data: Record<string, unknown> = { amount: 42
   };
 }
 
+function jsonResponse(status: number, body: unknown = { ok: true }): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 afterEach(async () => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+
   if (createdIds.length === 0 && createdEventIds.length === 0) {
     return;
   }
@@ -178,7 +198,30 @@ describe("GET /api/v1/events/:id", () => {
 });
 
 describe("POST /api/v1/events/:id/process", () => {
-  it("processes a PENDING event → 200 SUCCEEDED", async () => {
+  beforeEach(() => {
+    for (const key of DELIVERY_ENV_KEYS) {
+      savedDeliveryEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.DELIVERY_WEBHOOK_URL = "https://example.com/webhook/test";
+    process.env.DELIVERY_TIMEOUT_MS = "5000";
+  });
+
+  afterEach(() => {
+    for (const key of DELIVERY_ENV_KEYS) {
+      const previous = savedDeliveryEnv[key];
+      if (previous === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous;
+      }
+    }
+  });
+
+  it("HTTP 2xx → 200 SUCCEEDED and calls fetch once", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
     const eventId = uniqueEventId("proc_ok");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
@@ -197,30 +240,49 @@ describe("POST /api/v1/events/:id/process", () => {
     });
     expect(typeof res.body.processed_at).toBe("string");
     expect(typeof res.body.last_attempt_at).toBe("string");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://example.com/webhook/test");
   });
 
-  it("stub force_fail → 200 FAILED with last_error", async () => {
-    const eventId = uniqueEventId("proc_fail");
+  it("HTTP 500 → 200 FAILED with last_error; retry then SUCCEEDED", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(500))
+      .mockResolvedValueOnce(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_retry");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
-      .send(validBody(eventId, { force_fail: true }));
+      .send(validBody(eventId));
     expect(created.status).toBe(201);
     track(created.body);
 
-    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
-
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
+    const failed = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(failed.status).toBe(200);
+    expect(failed.body).toMatchObject({
       id: created.body.id,
       status: "FAILED",
       attempt_count: 1,
       processed_at: null,
     });
-    expect(typeof res.body.last_error).toBe("string");
-    expect(res.body.last_error.length).toBeGreaterThan(0);
+    expect(failed.body.last_error).toContain("500");
+
+    const ok = await request(app).post(`/api/v1/events/${created.body.id}/process`);
+    expect(ok.status).toBe(200);
+    expect(ok.body).toMatchObject({
+      status: "SUCCEEDED",
+      attempt_count: 2,
+      last_error: null,
+    });
+    expect(typeof ok.body.processed_at).toBe("string");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("already SUCCEEDED → 200 idempotent no-op (attempt_count unchanged)", async () => {
+  it("already SUCCEEDED → 200 no-op does not call fetch", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
     const eventId = uniqueEventId("proc_idem");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
@@ -232,6 +294,9 @@ describe("POST /api/v1/events/:id/process", () => {
     expect(first.status).toBe(200);
     expect(first.body.status).toBe("SUCCEEDED");
     expect(first.body.attempt_count).toBe(1);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    fetchMock.mockClear();
 
     const second = await request(app).post(`/api/v1/events/${created.body.id}/process`);
     expect(second.status).toBe(200);
@@ -240,9 +305,13 @@ describe("POST /api/v1/events/:id/process", () => {
       attempt_count: 1,
       processed_at: first.body.processed_at,
     });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("unknown id → 404 NOT_FOUND", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
     const res = await request(app).post(
       "/api/v1/events/cmmissing00000000000000000/process",
     );
@@ -252,43 +321,41 @@ describe("POST /api/v1/events/:id/process", () => {
       code: "NOT_FOUND",
       message: "Event not found",
     });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("retry after fail then succeed when force_fail cleared", async () => {
-    const eventId = uniqueEventId("proc_retry");
+  it("missing DELIVERY_WEBHOOK_URL → 200 FAILED", async () => {
+    delete process.env.DELIVERY_WEBHOOK_URL;
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const eventId = uniqueEventId("proc_nourl");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
-      .send(validBody(eventId, { force_fail: true }));
+      .send(validBody(eventId));
     expect(created.status).toBe(201);
     track(created.body);
 
-    const failed = await request(app).post(`/api/v1/events/${created.body.id}/process`);
-    expect(failed.status).toBe(200);
-    expect(failed.body.status).toBe("FAILED");
-    expect(failed.body.attempt_count).toBe(1);
+    const res = await request(app).post(`/api/v1/events/${created.body.id}/process`);
 
-    await prisma.event.update({
-      where: { id: created.body.id },
-      data: {
-        payload: validBody(eventId, { amount: 1, currency: "USD" }),
-      },
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      status: "FAILED",
+      attempt_count: 1,
+      processed_at: null,
     });
-
-    const ok = await request(app).post(`/api/v1/events/${created.body.id}/process`);
-    expect(ok.status).toBe(200);
-    expect(ok.body).toMatchObject({
-      status: "SUCCEEDED",
-      attempt_count: 2,
-      last_error: null,
-    });
-    expect(typeof ok.body.processed_at).toBe("string");
+    expect(res.body.last_error).toContain("DELIVERY_WEBHOOK_URL");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("exhausted retries → 409 PROCESSING_EXHAUSTED", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(500));
+    vi.stubGlobal("fetch", fetchMock);
+
     const eventId = uniqueEventId("proc_exh");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
-      .send(validBody(eventId, { force_fail: true }));
+      .send(validBody(eventId));
     expect(created.status).toBe(201);
     track(created.body);
 
@@ -306,13 +373,22 @@ describe("POST /api/v1/events/:id/process", () => {
     expect(exhausted.body).toMatchObject({
       code: "PROCESSING_EXHAUSTED",
     });
+    expect(fetchMock).toHaveBeenCalledTimes(MAX_ATTEMPTS);
 
     const row = await prisma.event.findUnique({ where: { id: created.body.id } });
     expect(row?.status).toBe("FAILED");
     expect(row?.attemptCount).toBe(MAX_ATTEMPTS);
   });
 
-  it("concurrent process claims → one winner; final status not corrupted", async () => {
+  it("concurrent process claims → one winner; fetch once; final status not corrupted", async () => {
+    // Slow resolve so the loser can still see PROCESSING while the winner delivers.
+    let release!: (value: Response) => void;
+    const gate = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation(() => gate);
+    vi.stubGlobal("fetch", fetchMock);
+
     const eventId = uniqueEventId("proc_race");
     const created = await request(app)
       .post("/api/v1/webhooks/events")
@@ -321,10 +397,15 @@ describe("POST /api/v1/events/:id/process", () => {
     track(created.body);
 
     const path = `/api/v1/events/${created.body.id}/process`;
-    const [a, b] = await Promise.all([
-      request(app).post(path),
-      request(app).post(path),
-    ]);
+    const pending = Promise.all([request(app).post(path), request(app).post(path)]);
+
+    // Wait until the winner has claimed and started delivery.
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    release(jsonResponse(200));
+
+    const [a, b] = await pending;
 
     const outcomes = [
       { status: a.status, body: a.body },
@@ -349,6 +430,8 @@ describe("POST /api/v1/events/:id/process", () => {
     for (const conflict of conflicts) {
       expect(conflict.body.code).toBe("PROCESSING_IN_PROGRESS");
     }
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
 
     const row = await prisma.event.findUnique({ where: { id: created.body.id } });
     expect(row?.status).toBe("SUCCEEDED");

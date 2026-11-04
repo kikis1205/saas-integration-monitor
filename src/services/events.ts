@@ -1,7 +1,7 @@
 import { EventStatus, Prisma, type Event } from "@prisma/client";
 import { prisma } from "../db/prisma";
 import type { WebhookEvent } from "../schemas/webhookEvent";
-import { runProcessStub } from "./processStub";
+import { deliverWebhook } from "./deliverWebhook";
 
 export const DEFAULT_LIST_LIMIT = 20;
 export const MAX_LIST_LIMIT = 100;
@@ -163,8 +163,8 @@ function classifyUnclaimed(row: Event | null): "not_found" | "succeeded" | "retr
 }
 
 /**
- * Claim → run local stub → SUCCEEDED or FAILED.
- * Already-SUCCEEDED → idempotent no-op (same row).
+ * Claim → POST outbound webhook → SUCCEEDED or FAILED.
+ * Already-SUCCEEDED → idempotent no-op (same row; no HTTP).
  * Throws ProcessEventError for missing / in-flight / exhausted.
  *
  * If a peer finishes between our lost claim and re-read, leaving the row
@@ -219,7 +219,7 @@ export async function processEvent(id: string): Promise<Event> {
   }
 
   try {
-    runProcessStub(claimed);
+    await deliverWebhook(claimed);
     return await markEventSucceeded(claimed.id);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown processing error";

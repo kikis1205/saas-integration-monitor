@@ -1,6 +1,6 @@
 # saas-integration-monitor
 
-Portfolio webhook API for **SaaS integration monitoring / support engineering**: accept vendor webhooks, validate them, persist them, inspect what arrived, and run an **on-demand local process stub** — the kind of plumbing that sits behind “why didn’t that invoice sync?” tickets.
+Portfolio webhook API for **SaaS integration monitoring / support engineering**: accept vendor webhooks, validate them, persist them, inspect what arrived, and **deliver on demand over HTTP** — the kind of plumbing that sits behind “why didn’t that invoice sync?” tickets.
 
 Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 
@@ -10,11 +10,12 @@ Node.js · TypeScript · Express · Zod · PostgreSQL · Prisma · Vitest
 |-----------|-----------|
 | **1** | Express `GET /health`; Zod-validated `POST /api/v1/webhooks/events` |
 | **2** | Postgres + Prisma persistence; `GET` list / get-by-id; Vitest + Supertest against real Postgres |
-| **3** | Event `status` + attempts; on-demand `POST /api/v1/events/:id/process`; local stub; retries up to `MAX_ATTEMPTS = 3`; exhaust → 409; idempotent `SUCCEEDED` |
+| **3** | Event `status` + attempts; on-demand `POST /api/v1/events/:id/process`; retries up to `MAX_ATTEMPTS = 3`; exhaust → 409; idempotent `SUCCEEDED` |
+| **4** (partial) | Process POSTs the stored event JSON to `DELIVERY_WEBHOOK_URL` (native `fetch`); timeout / non-2xx / missing URL → `FAILED` + existing retries |
 
-**Not yet:** n8n / external delivery, auth, dashboard, queues / workers, stuck-`PROCESSING` reclaim.
+**Not yet:** auth, dashboard, queues / workers, stuck-`PROCESSING` reclaim. Full README demo polish for delivery is still in progress.
 
-Webhook ingest still only validates and persists. Processing is a **separate** step. The process handler is an **in-process stub** (deterministic success/fail from payload) — it does **not** call n8n or any external system.
+Webhook ingest still only validates and persists. Processing is a **separate** on-demand step that now **POSTs outbound HTTP** to the configured webhook URL (n8n, webhook.site, etc.).
 
 ## Event status lifecycle
 
@@ -30,7 +31,7 @@ Webhook ingest still only validates and persists. Processing is a **separate** s
 |-------|---------|
 | `status` | `PENDING` \| `PROCESSING` \| `SUCCEEDED` \| `FAILED` |
 | `attempt_count` | Incremented on each successful **claim** (entering `PROCESSING`) |
-| `last_error` | Truncated stub error when `FAILED`; cleared on success |
+| `last_error` | Truncated delivery error when `FAILED`; cleared on success |
 | `last_attempt_at` | When the latest claim started |
 | `processed_at` | Set when `SUCCEEDED`; otherwise null |
 
@@ -44,18 +45,18 @@ Constant: `MAX_ATTEMPTS = 3` (includes the first try). Retries are **on-demand**
 - `POST /api/v1/webhooks/events` — validate, **persist**, return created resource (**201**; duplicate `event_id` → **409**); new rows are `PENDING` / `attempt_count: 0`
 - `GET /api/v1/events` — list (newest `received_at` first; default limit **20**, max **100**)
 - `GET /api/v1/events/:id` — fetch by **internal** cuid `id` (not vendor `event_id`)
-- `POST /api/v1/events/:id/process` — claim → **local stub** → `SUCCEEDED` or `FAILED`
+- `POST /api/v1/events/:id/process` — claim → **HTTP POST** to `DELIVERY_WEBHOOK_URL` → `SUCCEEDED` or `FAILED`
 
 ### Process endpoint codes
 
 | HTTP | When |
 |------|------|
-| **200** | Stub succeeded → `SUCCEEDED`; or already `SUCCEEDED` (idempotent no-op) |
-| **200** | Stub failed this attempt → body `status: "FAILED"` (inspect body) |
+| **200** | Delivery 2xx → `SUCCEEDED`; or already `SUCCEEDED` (idempotent no-op, **no HTTP**) |
+| **200** | Delivery failed this attempt (non-2xx / timeout / network / missing URL) → body `status: "FAILED"` |
 | **404** | Unknown id (`NOT_FOUND`) |
 | **409** | Already `PROCESSING` (`PROCESSING_IN_PROGRESS`) or retries exhausted (`PROCESSING_EXHAUSTED`) |
 
-**Stub rule:** if stored `payload.data.force_fail === true`, the attempt fails; otherwise it succeeds. No network calls.
+**Delivery:** one outbound `fetch` POST per claim. Set `DELIVERY_WEBHOOK_URL` in `.env` (see `.env.example`). Optional: `DELIVERY_TIMEOUT_MS` (default 5000), `DELIVERY_WEBHOOK_SECRET` (`X-Webhook-Secret`). Automated tests mock `fetch`; they do not hit a real webhook.
 
 ## Prerequisites
 
@@ -76,6 +77,7 @@ docker compose ps
 
 Copy-Item .env.example .env
 # Defaults match compose (user/password/db: sim). Edit only if you changed credentials.
+# Set DELIVERY_WEBHOOK_URL before processing events (e.g. webhook.site or n8n).
 # .env is gitignored — never commit secrets.
 
 # If `npm run dev` is already listening on :3000, stop it before `prisma generate`
@@ -150,9 +152,14 @@ Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post
 
 Expect **201** with `id`, `event_id`, `event_type`, `occurred_at`, `payload`, `received_at`, plus status fields (`status: "PENDING"`, `attempt_count: 0`, `last_error` / `last_attempt_at` / `processed_at` null). List and get responses include the same status fields.
 
-### Process → SUCCEEDED (local stub)
+### Process → SUCCEEDED (outbound HTTP)
+
+Requires `DELIVERY_WEBHOOK_URL` in `.env` pointing at a receiver that returns 2xx (e.g. [webhook.site](https://webhook.site) — copy your unique URL).
 
 ```powershell
+# In .env first: DELIVERY_WEBHOOK_URL="https://webhook.site/your-unique-id"
+# Restart npm run dev after editing .env
+
 $created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
   event_id    = "evt_proc_ok_$(Get-Random)"
   event_type  = "invoice.paid"
@@ -164,75 +171,12 @@ $processed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($crea
 $processed.status          # SUCCEEDED
 $processed.attempt_count   # 1
 $processed.processed_at    # ISO timestamp
+# Check webhook.site — you should see one POST with the event JSON + Idempotency-Key header
 ```
 
-### Process with `force_fail` → FAILED
+Missing / bad URL, timeout, or non-2xx → `status: "FAILED"` with `last_error` (still HTTP **200** on the process route). Call process again to retry until `attempt_count` reaches 3. Already-`SUCCEEDED` process calls return **200** with the same row and **do not** POST again.
 
-```powershell
-$failBody = @{
-  event_id    = "evt_proc_fail_$(Get-Random)"
-  event_type  = "invoice.paid"
-  occurred_at = "2026-03-20T12:00:00.000Z"
-  data        = @{ force_fail = $true }
-} | ConvertTo-Json
-
-$failedCreate = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body $failBody
-$failed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($failedCreate.id)/process" -Method Post
-$failed.status        # FAILED
-$failed.attempt_count # 1
-$failed.last_error    # stub message
-```
-
-Calling process again on a retryable `FAILED` event claims another attempt (until `attempt_count` reaches 3). Already-`SUCCEEDED` process calls return **200** with the same row (no-op).
-
-### Retry after fail → SUCCEEDED
-
-Demo path: fail once with `force_fail`, clear that flag on the stored payload, process again.
-
-```powershell
-$retryId = "evt_retry_$(Get-Random)"
-$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
-  event_id    = $retryId
-  event_type  = "invoice.paid"
-  occurred_at = "2026-03-20T12:00:00.000Z"
-  data        = @{ force_fail = $true }
-} | ConvertTo-Json)
-
-$failed = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
-$failed.status        # FAILED
-$failed.attempt_count # 1
-
-# Clear force_fail on the stored payload (demo / test helper — not a public API).
-# Prefer Prisma here: docker/psql JSON quoting is fragile under Windows PowerShell.
-$env:EVENT_ID = $created.id
-node -e "require('dotenv').config(); const {PrismaClient}=require('@prisma/client'); const p=new PrismaClient(); p.event.update({where:{id:process.env.EVENT_ID}, data:{payload:{event_id:'cleared', event_type:'invoice.paid', occurred_at:'2026-03-20T12:00:00.000Z', data:{amount:1, currency:'USD'}}}}).then(()=>p.`$disconnect());"
-
-$ok = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
-$ok.status        # SUCCEEDED
-$ok.attempt_count # 2
-$ok.last_error    # null
-```
-
-### Exhaust retries → 409 `PROCESSING_EXHAUSTED`
-
-```powershell
-$exhId = "evt_exh_$(Get-Random)"
-$created = Invoke-RestMethod -Uri http://localhost:3000/api/v1/webhooks/events -Method Post -ContentType "application/json" -Body (@{
-  event_id    = $exhId
-  event_type  = "invoice.paid"
-  occurred_at = "2026-03-20T12:00:00.000Z"
-  data        = @{ force_fail = $true }
-} | ConvertTo-Json)
-
-1..3 | ForEach-Object {
-  $r = Invoke-RestMethod -Uri "http://localhost:3000/api/v1/events/$($created.id)/process" -Method Post
-  "$($r.status) attempt=$($r.attempt_count)"
-}
-
-# Fourth call → 409 PROCESSING_EXHAUSTED (curl shows status + body clearly)
-curl.exe -s -i -X POST "http://localhost:3000/api/v1/events/$($created.id)/process"
-```
-
+Failure / exhaust / retry paths are covered by `npm test` (mocked `fetch`). Optional live smoke: point `DELIVERY_WEBHOOK_URL` at webhook.site as above; to demo a soft fail, temporarily set the URL to a host that returns 500 or leave it unset.
 ### Duplicate `event_id` → 409
 
 Same `event_id` again → **409** `code: CONFLICT`.
@@ -266,12 +210,13 @@ prisma/                  # schema + migrations
 src/
   index.ts               # entry — fail-fast DB check, bind PORT
   app.ts                 # Express + routes (createApp for tests)
+  config/delivery.ts     # DELIVERY_WEBHOOK_* env parse
   db/prisma.ts           # PrismaClient singleton
-  services/events.ts     # create / list / get / process (claim + mark)
-  services/processStub.ts # pure local stub (force_fail)
+  services/events.ts     # create / list / get / process (claim + deliver + mark)
+  services/deliverWebhook.ts  # outbound fetch POST
   schemas/webhookEvent.ts
   middleware/errorHandler.ts
-tests/                   # Vitest + Supertest
+tests/                   # Vitest + Supertest (+ fetch mocks for delivery)
 docker-compose.yml       # local Postgres 16
-.env.example             # DATABASE_URL + PORT placeholders
+.env.example             # DATABASE_URL, PORT, delivery placeholders
 ```
